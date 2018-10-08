@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -e
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+source ${DIR}/kafka-connect-ops
+
+CONNECT_JOB_NAME=${1}
+CONNECT_API_URL=${2-http://localhost:8083}
+
+[[ -z ${CONNECT_JOB_NAME} ]] && error-with-exit "Usage:\n\t$(basename $0) [connect-job-name] [base-url]"
+
+while true; do
+    read -p "are you sure you wish to delete the connect job? y/n " yn
+    case $yn in
+        [Yy]* )
+            kafka-connect-job-delete "${CONNECT_JOB_NAME}" "${CONNECT_API_URL}" | jq .
+            break;;
+        [Nn]* )
+            break;;
+        * ) echo "Please answer yes or no.";;
+    esac
+done
