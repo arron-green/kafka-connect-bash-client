@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -e
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+source ${DIR}/kafka-connect-ops
+
+JOB_PATH=${1}
+CONNECT_API_URL=${2-http://localhost:8083}
+
+[[ -z ${JOB_PATH} ]] && error-with-exit "Usage:\n\t$(basename $0) [path-to-properties-file] [base-url]"
+[[ -e ${JOB_PATH} && -f ${JOB_PATH} ]] || error-with-exit "path to ${JOB_PATH} cannot be found"
+[[ ${JOB_PATH##*.} == "properties" ]] || error-with-exit "${JOB_PATH} must be a properties file"
+
+JOB_CONF="$(kafka-connect-props-conf-with-name "${JOB_PATH}")"
+VALIDATE_RESP=$(kafka-connect-validate-plugin-config "${JOB_CONF}" "${CONNECT_API_URL}")
+NUM_ERRORS=$(echo $VALIDATE_RESP | jq -r -c '.error_count')
+if [[ $NUM_ERRORS == 0 ]]; then
+    kafka-connect-job-update-or-create "${JOB_CONF}" "${CONNECT_API_URL}" | jq .
+else
+    while read ERROR; do
+        echoerr "$ERROR"
+    done < <(echo $VALIDATE_RESP | jq -rc 'if .message != null then .message else .configs[] .value .errors[] end')
+fi

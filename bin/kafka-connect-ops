@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+set -e
+echoerr() { printf "%s\n" "$*" >&2; }
+error-with-exit() {
+    echoerr $@
+    exit 1
+}
+
+kafka-connect-props-to-json() {
+    if [ "$#" = "0" ] || [ "$1" = "-" ]; then
+        # if no args are passed in or the first arg is a hyphen then default to STDIN as the input
+        INPUT="-"
+    else
+        # else assume input is a list of file names
+        INPUT=$@
+    fi
+    while read PROP; do
+        echo "{}" | jq -r -c \
+            --arg KEY "${PROP%%=*}" \
+            --arg VALUE "${PROP#*=}" \
+            '{key: $KEY, value: $VALUE}'
+    done < <(cat $INPUT | grep -Ev '^#|^$') | jq --slurp 'from_entries'
+}
+
+kafka-connect-props-conf-with-name() {
+    CONF=$(kafka-connect-props-to-json $@)
+    NAME="$(echo ${CONF} | jq -r -c '.name // ""')"
+    [[ -z "${NAME}" ]] && error-with-exit "name field is required"
+    echo ${CONF} | jq -r -c '{name: (.name), config: (to_entries | map(select(.key != "name")) | from_entries)}'
+}
+
+kafka-connect-connectors() {
+    # Get a list of active connectors
+    local CONNECT_API_URL=$1
+    [[ -z $CONNECT_API_URL ]] && (echoerr "Usage: connectors [connect-base-url]"; exit 1)
+    curl --fail --show-error -ks -XGET -H "Content-Type: application/json" "${CONNECT_API_URL%*/}/connectors"
+}
+
+kafka-connect-job-create-new() {
+    # Create a new connector, returning the current connector info if successful.
+    # Return 409 (Conflict) if rebalance is in process.
+    local CONNECT_PLUGIN_JSON=$1
+    local CONNECT_API_URL=$2
+    [[ -z $CONNECT_PLUGIN_JSON || -z $CONNECT_API_URL ]] && (echoerr "Usage: create-new [connect-config-json] [connect-base-url]"; exit 1)
+    CONNECT_NAME="$(echo ${CONNECT_PLUGIN_JSON} | jq -r -c '.name // ""')"
+    CONNECT_CONF="$(echo ${CONNECT_PLUGIN_JSON} | jq -r -c '.config // ""')"
+    [[ -z $CONNECT_NAME || -z $CONNECT_CONF ]] && (echoerr "Usage: create-new unexpected json. both .name and .config are required"; exit 1)
+    curl --fail --show-error -ks -XPOST -H "Content-Type: application/json" --data "${PAYLOAD}" "${CONNECT_API_URL%*/}/connectors"
+}
+
+kafka-connect-job-info() {
+    # Get information about the connector
+    local CONNECT_JOB_NAME=$1
+    local CONNECT_API_URL=$2
+    [[ -z $CONNECT_JOB_NAME || -z $CONNECT_API_URL ]] && (echoerr "Usage: info [connect-job-name] [connect-base-url]"; exit 1)
+    curl --fail --show-error -ks -XGET -H "Content-Type: application/json" "${CONNECT_API_URL%*/}/connectors/${CONNECT_JOB_NAME}"
+}
+
+kafka-connect-job-config() {
+    # Get the configuration for the connector
+    local CONNECT_JOB_NAME=$1
+    local CONNECT_API_URL=$2
+    [[ -z $CONNECT_JOB_NAME || -z $CONNECT_API_URL ]] && (echoerr "Usage: info [connect-job-name] [connect-base-url]"; exit 1)
+    curl --fail --show-error -ks -XGET -H "Content-Type: application/json" "${CONNECT_API_URL%*/}/connectors/${CONNECT_JOB_NAME}/config"
+}
+
+kafka-connect-job-update-or-create() {
+    # Create a new connector using the given configuration, or update the configuration for an existing connector.
+    # Returns information about the connector after the change has been made. Return 409 (Conflict) if rebalance is in process.
+    local CONNECT_PLUGIN_JSON=$1
+    local CONNECT_API_URL=$2
+    [[ -z $CONNECT_PLUGIN_JSON || -z $CONNECT_API_URL ]] && (echoerr "Usage: update-or-create [connect-config-json] [connect-base-url]"; exit 1)
+    CONNECT_NAME="$(echo ${CONNECT_PLUGIN_JSON} | jq -r -c '.name // ""')"
+    CONNECT_CONF="$(echo ${CONNECT_PLUGIN_JSON} | jq -r -c '.config // ""')"
+    [[ -z $CONNECT_NAME || -z $CONNECT_CONF ]] && (echoerr "Usage: update-or-create unexpected json. both .name and .config are required"; exit 1)
+    curl --fail --show-error -ks -XPUT -H "Content-Type: application/json" --data "${CONNECT_CONF}" "${CONNECT_API_URL%*/}/connectors/${CONNECT_NAME}/config"
+}
+
+kafka-connect-job-status() {
+    # Get current status of the connector, including whether it is running,
+    # failed or paused, which worker it is assigned to, error information if it has failed, and the state of all its tasks.
+    local CONNECT_JOB_NAME=$1
+    local CONNECT_API_URL=$2
+    [[ -z $CONNECT_JOB_NAME || -z $CONNECT_API_URL ]] && (echoerr "Usage: status [connect-job-name] [connect-base-url]"; exit 1)
+    curl --fail --show-error -ks -XGET -H "Content-Type: application/json" "${CONNECT_API_URL%*/}/connectors/${CONNECT_JOB_NAME}/status"
+}
+
+kafka-connect-job-restart() {
+    # Restart the connector and its tasks. Return 409 (Conflict) if rebalance is in process.
+    local CONNECT_JOB_NAME=$1
+    local CONNECT_API_URL=$2
+    [[ -z $CONNECT_JOB_NAME || -z $CONNECT_API_URL ]] && (echoerr "Usage: restart [connect-job-name] [connect-base-url]"; exit 1)
+    curl --fail --show-error -ks -XPOST -H "Content-Type: application/json" "${CONNECT_API_URL%*/}/connectors/${CONNECT_JOB_NAME}/restart"
+}
+
+kafka-connect-job-pause() {
+    # Pause the connector and its tasks, which stops message processing until the connector is resumed.
+    # This call asynchronous and the tasks will not transition to PAUSED state at the same time.
+    local CONNECT_JOB_NAME=$1
+    local CONNECT_API_URL=$2
+    [[ -z $CONNECT_JOB_NAME || -z $CONNECT_API_URL ]] && (echoerr "Usage: pause [connect-job-name] [connect-base-url]"; exit 1)
+    curl --fail --show-error -ks -XPUT -H "Content-Type: application/json" "${CONNECT_API_URL%*/}/connectors/${CONNECT_JOB_NAME}/pause"
+}
+
+kafka-connect-job-resume() {
+    # Resume a paused connector or do nothing if the connector is not paused.
+    # This call asynchronous and the tasks will not transition to RUNNING state at the same time
+    local CONNECT_JOB_NAME=$1
+    local CONNECT_API_URL=$2
+    [[ -z $CONNECT_JOB_NAME || -z $CONNECT_API_URL ]] && (echoerr "Usage: resume [connect-job-name] [connect-base-url]"; exit 1)
+    curl --fail --show-error -ks -XPUT -H "Content-Type: application/json" "${CONNECT_API_URL%*/}/connectors/${CONNECT_JOB_NAME}/resume"
+}
+
+kafka-connect-job-delete() {
+    # Delete a connector, halting all tasks and deleting its configuration. Return 409 (Conflict) if rebalance is in process
+    local CONNECT_JOB_NAME=$1
+    local CONNECT_API_URL=$2
+    [[ -z $CONNECT_JOB_NAME || -z $CONNECT_API_URL ]] && (echoerr "Usage: delete [connect-job-name] [connect-base-url]"; exit 1)
+    curl --fail --show-error -ks -XDELETE -H "Content-Type: application/json" "${CONNECT_API_URL%*/}/connectors/${CONNECT_JOB_NAME}/"
+}
+
+kafka-connect-job-tasks() {
+    # Get a list of tasks currently running for the connector
+    local CONNECT_JOB_NAME=$1
+    local CONNECT_API_URL=$2
+    [[ -z $CONNECT_JOB_NAME || -z $CONNECT_API_URL ]] && (echoerr "Usage: tasks [connect-job-name] [connect-base-url]"; exit 1)
+    curl --fail --show-error -ks -XGET -H "Content-Type: application/json" "${CONNECT_API_URL%*/}/connectors/${CONNECT_JOB_NAME}/tasks"
+}
+
+kafka-connect-job-tasks-status() {
+    # Get a task’s status
+    local CONNECT_JOB_NAME=$1
+    local CONNECT_TASK_ID=$2
+    local CONNECT_API_URL=$3
+    [[ -z $CONNECT_JOB_NAME || -z $CONNECT_TASK_ID || -z $CONNECT_API_URL ]] && (echoerr "Usage: tasks status [connect-job-name] [connect-task-id] [connect-base-url]"; exit 1)
+    curl --fail --show-error -ks -XGET -H "Content-Type: application/json" "${CONNECT_API_URL%*/}/connectors/${CONNECT_JOB_NAME}/tasks/${CONNECT_TASK_ID}/status"
+}
+
+kafka-connect-job-tasks-restart() {
+    # Restart an individual task
+    local CONNECT_JOB_NAME=$1
+    local CONNECT_TASK_ID=$2
+    local CONNECT_API_URL=$3
+    [[ -z $CONNECT_JOB_NAME || -z $CONNECT_TASK_ID || -z $CONNECT_API_URL ]] && (echoerr "Usage: tasks restart [connect-job-name] [connect-task-id] [connect-base-url]"; exit 1)
+    curl --fail --show-error -ks -XPOST -H "Content-Type: application/json" "${CONNECT_API_URL%*/}/connectors/${CONNECT_JOB_NAME}/tasks/${CONNECT_TASK_ID}/restart"
+}
+
+kafka-connect-plugins() {
+    # Return a list of connector plugins installed in the Kafka Connect cluster.
+    # Note that the API only checks for connectors on the worker that handles the request,
+    # which means it is possible to see inconsistent results, especially during a rolling upgrade if you add new connector jars.
+    local CONNECT_API_URL=$1
+    [[ -z $CONNECT_API_URL ]] && (echoerr "Usage: plugins [connect-base-url]"; exit 1)
+    curl --fail --show-error -ks -XGET -H "Content-Type: application/json" "${CONNECT_API_URL%*/}/connector-plugins/"
+}
+
+kafka-connect-validate-plugin-config() {
+    # Validate the provided configuration values against the configuration definition.
+    # This API performs per config validation, returns suggested values and error messages during validation.
+    local CONNECT_PLUGIN_JSON=$1
+    local CONNECT_API_URL=$2
+    [[ -z $CONNECT_PLUGIN_JSON || -z $CONNECT_API_URL ]] && (echoerr "Usage: config-validate [connect-config-json] [connect-base-url]"; exit 1)
+    CONNECT_JOB_NAME="$(echo ${CONNECT_PLUGIN_JSON} | jq -r -c '.name // ""')"
+    [[ -z $CONNECT_JOB_NAME ]] && (echoerr "Usage: config-validate config json is missing required path '.name'"; exit 1)
+    CONNECT_PLUGIN_CONF="$(echo ${CONNECT_PLUGIN_JSON} | jq -r -c '.config // ""')"
+    [[ -z $CONNECT_PLUGIN_CONF ]] && (echoerr "Usage: config-validate config json is missing required path '.config'"; exit 1)
+    CONNECT_PLUGIN_NAME="$(echo ${CONNECT_PLUGIN_CONF} | jq -r -c '."connector.class" // ""')"
+    [[ -z $CONNECT_PLUGIN_NAME ]] && (echoerr "Usage: config-validate config json is missing required path '.connector.class'"; exit 1)
+    VALIDATE_PAYLOAD=$(echo $CONNECT_PLUGIN_CONF | jq -r -c --arg NAME $CONNECT_JOB_NAME '. + {name: $NAME}')
+    curl --fail --show-error -ks -XPUT -H "Content-Type: application/json" --data "${VALIDATE_PAYLOAD}" "${CONNECT_API_URL%*/}/connector-plugins/${CONNECT_PLUGIN_NAME}/config/validate"
+}
